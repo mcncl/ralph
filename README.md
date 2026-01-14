@@ -10,16 +10,16 @@ Ralph is a development methodology based on continuous AI agent loops. Named aft
 
 ```
 ┌─────────────────────────────────────────┐
-│           Ralph Loop                     │
-│                                          │
+│           Ralph Loop                    │
+│                                         │
 │  ┌──────┐    ┌──────┐    ┌──────────┐   │
 │  │Prompt│───▶│ Amp  │───▶│Check Done│   │
 │  └──────┘    └──────┘    └────┬─────┘   │
 │      ▲                        │         │
 │      │         No             │         │
 │      └────────────────────────┘         │
-│                                          │
-│              Yes ──▶ Exit                │
+│                                         │
+│              Yes ──▶ Exit               │
 └─────────────────────────────────────────┘
 ```
 
