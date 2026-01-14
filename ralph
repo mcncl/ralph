@@ -1,0 +1,1377 @@
+#!/usr/bin/env bash
+#
+# Ralph - Iterative AI Agent Loop for Amp
+# A self-referential feedback loop that repeatedly runs Amp until completion.
+#
+# Usage: ralph <command> [options]
+#
+# Commands:
+#   start   - Start a new Ralph loop
+#   resume  - Resume a paused/failed job
+#   status  - Show job status
+#   list    - List recent jobs
+#   cancel  - Cancel a running job
+#   tail    - Tail job logs
+#   help    - Show this help
+#
+
+set -euo pipefail
+
+# Configuration
+RALPH_VERSION="1.0.0"
+RALPH_DIR="${RALPH_DIR:-.amp/ralph}"
+JOBS_DIR="${RALPH_DIR}/jobs"
+LOGS_DIR="${RALPH_DIR}/logs"
+MAX_LOG_SIZE=${MAX_LOG_SIZE:-10485760}  # 10MB
+MAX_LOG_BACKUPS=${MAX_LOG_BACKUPS:-3}
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+log_info() {
+    echo -e "${BLUE}[ralph]${NC} $*"
+}
+
+log_success() {
+    echo -e "${GREEN}[ralph]${NC} $*"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[ralph]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ralph]${NC} $*" >&2
+}
+
+log_header() {
+    echo -e "\n${BOLD}${CYAN}$*${NC}"
+}
+
+# Get current timestamp in ISO format
+timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Get timestamp for job ID (filesystem safe)
+timestamp_id() {
+    date +"%Y-%m-%dT%H-%M-%S"
+}
+
+# Generate a job ID
+generate_job_id() {
+    local description="$1"
+    local ts
+    ts=$(timestamp_id)
+    local slug
+    slug=$(echo "$description" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | head -c 30)
+    echo "ralph-${ts}_${slug}"
+}
+
+# Ensure directories exist
+ensure_dirs() {
+    mkdir -p "$JOBS_DIR" "$LOGS_DIR"
+}
+
+# Get the job state file path
+job_state_path() {
+    echo "${JOBS_DIR}/$1.json"
+}
+
+# Get the job log file path
+job_log_path() {
+    echo "${LOGS_DIR}/$1.log"
+}
+
+# Check if jq is available
+require_jq() {
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is required but not installed. Install with: brew install jq"
+        exit 1
+    fi
+}
+
+# Check if amp is available
+require_amp() {
+    if ! command -v amp &> /dev/null; then
+        log_error "amp CLI is required but not installed."
+        exit 1
+    fi
+}
+
+# ============================================================================
+# State Management
+# ============================================================================
+
+# Create a new job state
+create_job_state() {
+    local job_id="$1"
+    local description="$2"
+    local prompt_source="$3"
+    local prompt_file="$4"
+    local prompt_text="$5"
+    local max_iterations="$6"
+    local max_minutes="$7"
+    local done_string="$8"
+    local done_file="$9"
+    local done_cmd="${10}"
+    local git_enabled="${11}"
+    local checkpoint_every="${12}"
+    local expect_files="${13}"
+    local verify_cmd="${14}"
+
+    local cwd
+    cwd=$(pwd)
+    local now
+    now=$(timestamp)
+
+    cat <<EOF
+{
+  "version": 1,
+  "jobId": "$job_id",
+  "createdAt": "$now",
+  "updatedAt": "$now",
+  "cwd": "$cwd",
+  "status": "running",
+  "statusMessage": "starting",
+  "description": "$description",
+  "threadId": null,
+  "currentIteration": 0,
+  "prompt": {
+    "source": "$prompt_source",
+    "file": $(if [ -n "$prompt_file" ]; then echo "\"$prompt_file\""; else echo "null"; fi),
+    "text": $(if [ -n "$prompt_text" ]; then echo "$prompt_text" | jq -Rs .; else echo "null"; fi)
+  },
+  "completion": {
+    "mode": "any",
+    "doneString": $(if [ -n "$done_string" ]; then echo "\"$done_string\""; else echo "\"RALPH_STATUS:done\""; fi),
+    "doneFile": $(if [ -n "$done_file" ]; then echo "\"$done_file\""; else echo "null"; fi),
+    "doneCmd": $(if [ -n "$done_cmd" ]; then echo "\"$done_cmd\""; else echo "null"; fi),
+    "satisfied": false,
+    "satisfiedBy": null
+  },
+  "verification": {
+    "expectFiles": $(if [ -n "$expect_files" ]; then echo "$expect_files" | jq -Rs 'split(",") | map(gsub("^\\s+|\\s+$"; ""))'; else echo "[]"; fi),
+    "verifyCmd": $(if [ -n "$verify_cmd" ]; then echo "\"$verify_cmd\""; else echo "null"; fi),
+    "passed": false,
+    "failures": []
+  },
+  "limits": {
+    "maxIterations": $max_iterations,
+    "maxMinutes": $max_minutes
+  },
+  "metrics": {
+    "totalIterations": 0,
+    "startedAt": "$now",
+    "iterations": []
+  },
+  "safety": {
+    "stopReason": null,
+    "cancelledByUserAt": null
+  },
+  "git": {
+    "enabled": $git_enabled,
+    "startSha": null,
+    "lastCheckpointSha": null,
+    "checkpointEveryN": $checkpoint_every
+  }
+}
+EOF
+}
+
+# Load job state
+load_job_state() {
+    local job_id="$1"
+    local state_file
+    state_file=$(job_state_path "$job_id")
+
+    if [ ! -f "$state_file" ]; then
+        log_error "Job not found: $job_id"
+        exit 1
+    fi
+
+    cat "$state_file"
+}
+
+# Save job state
+save_job_state() {
+    local job_id="$1"
+    local state="$2"
+    local state_file
+    state_file=$(job_state_path "$job_id")
+
+    echo "$state" | jq '.' > "$state_file"
+}
+
+# Update job state field
+update_job_state() {
+    local job_id="$1"
+    local field="$2"
+    local value="$3"
+
+    local state
+    state=$(load_job_state "$job_id")
+    state=$(echo "$state" | jq "$field = $value | .updatedAt = \"$(timestamp)\"")
+    save_job_state "$job_id" "$state"
+    echo "$state"
+}
+
+# ============================================================================
+# Logging
+# ============================================================================
+
+# Write to job log
+log_to_file() {
+    local job_id="$1"
+    local message="$2"
+    local log_file
+    log_file=$(job_log_path "$job_id")
+
+    echo "[$(timestamp)] $message" >> "$log_file"
+}
+
+# Rotate logs if needed
+maybe_rotate_logs() {
+    local job_id="$1"
+    local log_file
+    log_file=$(job_log_path "$job_id")
+
+    if [ ! -f "$log_file" ]; then
+        return
+    fi
+
+    local size
+    size=$(stat -f%z "$log_file" 2>/dev/null || stat -c%s "$log_file" 2>/dev/null || echo 0)
+
+    if [ "$size" -gt "$MAX_LOG_SIZE" ]; then
+        # Rotate logs
+        for i in $(seq $((MAX_LOG_BACKUPS - 1)) -1 1); do
+            if [ -f "${log_file}.$i" ]; then
+                mv "${log_file}.$i" "${log_file}.$((i + 1))"
+            fi
+        done
+        mv "$log_file" "${log_file}.1"
+        log_info "Log rotated for job $job_id"
+    fi
+}
+
+# ============================================================================
+# Git Integration
+# ============================================================================
+
+# Get current git SHA
+get_git_sha() {
+    git rev-parse HEAD 2>/dev/null || echo ""
+}
+
+# Check if git repo
+is_git_repo() {
+    git rev-parse --git-dir &>/dev/null
+}
+
+# Create a git checkpoint
+git_checkpoint() {
+    local job_id="$1"
+    local iteration="$2"
+    local description="$3"
+
+    if ! is_git_repo; then
+        return
+    fi
+
+    # Check for changes
+    if git diff --quiet && git diff --cached --quiet; then
+        log_to_file "$job_id" "Git: No changes to commit"
+        return
+    fi
+
+    # Stage all changes
+    git add -A
+
+    # Commit
+    local message="ralph: iteration $iteration - $description
+
+Job: $job_id
+"
+
+    if git commit -m "$message" --quiet; then
+        local sha
+        sha=$(get_git_sha)
+        log_to_file "$job_id" "Git: Created checkpoint $sha"
+        echo "$sha"
+    else
+        log_to_file "$job_id" "Git: Commit failed"
+    fi
+}
+
+# ============================================================================
+# Completion Detection
+# ============================================================================
+
+# Check if done string is in output
+check_done_string() {
+    local output="$1"
+    local done_string="$2"
+
+    if [ -z "$done_string" ]; then
+        return 1
+    fi
+
+    if echo "$output" | grep -qF "$done_string"; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if done file exists
+check_done_file() {
+    local done_file="$1"
+
+    if [ -z "$done_file" ]; then
+        return 1
+    fi
+
+    if [ -f "$done_file" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Check if done command succeeds
+check_done_cmd() {
+    local done_cmd="$1"
+
+    if [ -z "$done_cmd" ]; then
+        return 1
+    fi
+
+    if eval "$done_cmd" &>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# ============================================================================
+# Verification
+# ============================================================================
+
+# Check if expected files exist (supports glob patterns and recursive search)
+check_expect_files() {
+    local job_id="$1"
+    local state="$2"
+    
+    local expect_files
+    expect_files=$(echo "$state" | jq -r '.verification.expectFiles[]' 2>/dev/null)
+    
+    if [ -z "$expect_files" ]; then
+        return 0  # No files to check
+    fi
+    
+    local missing_files=()
+    local found_count=0
+    local expected_count=0
+    
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        expected_count=$((expected_count + 1))
+        
+        local matches=""
+        
+        # Determine search strategy based on pattern
+        if [[ "$pattern" == /* ]] || [[ "$pattern" == ./* ]] || [[ "$pattern" == ../* ]] || [[ "$pattern" == .* && "$pattern" == *"/"* ]]; then
+            # Absolute path, explicit relative path, or dotfile/dotdir path (like .buildkite/foo)
+            if [ -f "$pattern" ]; then
+                matches="$pattern"
+            fi
+        elif [[ "$pattern" == *"/"* ]]; then
+            # Contains path separator - first try direct, then search
+            if [ -f "$pattern" ]; then
+                matches="$pattern"
+            else
+                matches=$(find . -path "./$pattern" -type f 2>/dev/null | head -1)
+                # Also try without leading ./
+                if [ -z "$matches" ]; then
+                    matches=$(find . -path "*/$pattern" -type f 2>/dev/null | head -1)
+                fi
+            fi
+        elif [[ "$pattern" == *"*"* ]]; then
+            # Glob pattern without path - search recursively
+            matches=$(find . -name "$pattern" -type f 2>/dev/null | head -1)
+        else
+            # Simple filename - search recursively anywhere in tree
+            matches=$(find . -name "$pattern" -type f 2>/dev/null | head -1)
+            # Also check current directory directly
+            if [ -z "$matches" ] && [ -f "$pattern" ]; then
+                matches="$pattern"
+            fi
+        fi
+        
+        if [ -n "$matches" ]; then
+            found_count=$((found_count + 1))
+            log_to_file "$job_id" "Verification: Found '$pattern' at $matches"
+            log_success "Found: $pattern → $matches"
+        else
+            missing_files+=("$pattern")
+            log_to_file "$job_id" "Verification: Missing '$pattern' (searched recursively)"
+        fi
+    done <<< "$expect_files"
+    
+    if [ ${#missing_files[@]} -eq 0 ]; then
+        log_success "All expected files found ($found_count/$expected_count)"
+        return 0
+    else
+        log_warn "Missing expected files: ${missing_files[*]}"
+        return 1
+    fi
+}
+
+# Run verification command
+check_verify_cmd() {
+    local job_id="$1"
+    local verify_cmd="$2"
+
+    if [ -z "$verify_cmd" ] || [ "$verify_cmd" = "null" ]; then
+        return 0  # No command to run
+    fi
+
+    log_info "Running verification: $verify_cmd"
+    log_to_file "$job_id" "Verification: Running '$verify_cmd'"
+
+    local output
+    local exit_code=0
+    output=$(eval "$verify_cmd" 2>&1) || exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        log_success "Verification passed"
+        log_to_file "$job_id" "Verification: PASSED"
+        return 0
+    else
+        log_error "Verification failed (exit code: $exit_code)"
+        log_to_file "$job_id" "Verification: FAILED - $output"
+        echo "$output" | head -10
+        return 1
+    fi
+}
+
+# Run all verification checks
+run_verification() {
+    local job_id="$1"
+    local state="$2"
+
+    local failures=()
+
+    # Check expected files
+    if ! check_expect_files "$job_id" "$state"; then
+        failures+=("expectFiles")
+    fi
+
+    # Check verification command
+    local verify_cmd
+    verify_cmd=$(echo "$state" | jq -r '.verification.verifyCmd // empty')
+    if ! check_verify_cmd "$job_id" "$verify_cmd"; then
+        failures+=("verifyCmd")
+    fi
+
+    # Update state with verification results
+    if [ ${#failures[@]} -eq 0 ]; then
+        state=$(echo "$state" | jq '.verification.passed = true | .verification.failures = []')
+        save_job_state "$job_id" "$state"
+        return 0
+    else
+        local failures_json
+        failures_json=$(printf '%s\n' "${failures[@]}" | jq -R . | jq -s .)
+        state=$(echo "$state" | jq ".verification.passed = false | .verification.failures = $failures_json")
+        save_job_state "$job_id" "$state"
+        return 1
+    fi
+}
+
+# ============================================================================
+# Iteration Loop
+# ============================================================================
+
+# Build the iteration prompt
+build_iteration_prompt() {
+    local base_prompt="$1"
+    local iteration="$2"
+    local done_string="$3"
+
+    if [ "$iteration" -eq 1 ]; then
+        cat <<EOF
+You are Amp, running inside an iterative loop called Ralph.
+
+Your task is:
+---
+$base_prompt
+---
+
+IMPORTANT INSTRUCTIONS FOR RALPH LOOP:
+1. Work on the task incrementally. Each iteration, make meaningful progress.
+2. Use tools to edit code, run tests, and inspect results.
+3. When you believe the task is FULLY COMPLETE, include this exact line in your response:
+   $done_string
+4. If you are still working and not done, include this line instead:
+   RALPH_STATUS:working
+5. Be thorough - only signal completion when ALL requirements are met.
+
+Begin working on the task now.
+EOF
+    else
+        cat <<EOF
+Ralph iteration $iteration. Continue working on the task.
+
+Remember:
+- Make incremental progress
+- When fully complete, output: $done_string
+- If still working, output: RALPH_STATUS:working
+
+Continue from where you left off.
+EOF
+    fi
+}
+
+# Run a single iteration
+# Parse usage from stream-json output
+parse_usage_from_json() {
+    local json_output="$1"
+    
+    # Extract usage from assistant messages in the JSON stream
+    # Sum up all token counts across multiple messages
+    echo "$json_output" | grep -o '"usage":{[^}]*}' | while read -r usage; do
+        echo "$usage"
+    done | tail -1
+}
+
+run_iteration() {
+    local job_id="$1"
+    local state="$2"
+    local iteration="$3"
+
+    local thread_id
+    thread_id=$(echo "$state" | jq -r '.threadId // empty')
+
+    local prompt_source
+    prompt_source=$(echo "$state" | jq -r '.prompt.source')
+
+    local base_prompt
+    if [ "$prompt_source" = "file" ]; then
+        local prompt_file
+        prompt_file=$(echo "$state" | jq -r '.prompt.file')
+        base_prompt=$(cat "$prompt_file")
+    else
+        base_prompt=$(echo "$state" | jq -r '.prompt.text')
+    fi
+
+    local done_string
+    done_string=$(echo "$state" | jq -r '.completion.doneString // "RALPH_STATUS:done"')
+
+    local message
+    message=$(build_iteration_prompt "$base_prompt" "$iteration" "$done_string")
+
+    local start_time
+    start_time=$(date +%s)
+
+    local raw_output
+    local exit_code=0
+
+    log_to_file "$job_id" "=== Iteration $iteration ==="
+    log_to_file "$job_id" "Thread: ${thread_id:-new}"
+
+    # Run amp with --stream-json to capture usage data
+    if [ -z "$thread_id" ]; then
+        # First iteration - create new thread
+        log_to_file "$job_id" "Creating new thread..."
+
+        # Run amp and capture JSON output
+        raw_output=$(echo "$message" | amp -x --dangerously-allow-all --no-ide --stream-json 2>&1) || exit_code=$?
+
+        # Get thread ID from JSON output
+        thread_id=$(echo "$raw_output" | grep -o '"session_id":"[^"]*"' | head -1 | sed 's/"session_id":"//;s/"//')
+
+        if [ -n "$thread_id" ]; then
+            state=$(echo "$state" | jq ".threadId = \"$thread_id\"")
+            save_job_state "$job_id" "$state"
+            log_to_file "$job_id" "Thread created: $thread_id"
+        fi
+    else
+        # Continue existing thread
+        log_to_file "$job_id" "Continuing thread $thread_id..."
+        raw_output=$(echo "$message" | amp threads continue "$thread_id" -x --dangerously-allow-all --no-ide --stream-json 2>&1) || exit_code=$?
+    fi
+
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+
+    # Parse usage from JSON output
+    local input_tokens=0
+    local output_tokens=0
+    local cache_read=0
+    local cache_write=0
+    
+    # Extract the last usage block (final totals)
+    local usage_json
+    usage_json=$(echo "$raw_output" | grep '"usage"' | tail -1)
+    
+    if [ -n "$usage_json" ]; then
+        input_tokens=$(echo "$usage_json" | grep -o '"input_tokens":[0-9]*' | grep -o '[0-9]*' || echo "0")
+        output_tokens=$(echo "$usage_json" | grep -o '"output_tokens":[0-9]*' | grep -o '[0-9]*' || echo "0")
+        cache_read=$(echo "$usage_json" | grep -o '"cache_read_input_tokens":[0-9]*' | grep -o '[0-9]*' || echo "0")
+        cache_write=$(echo "$usage_json" | grep -o '"cache_creation_input_tokens":[0-9]*' | grep -o '[0-9]*' || echo "0")
+    fi
+    
+    # Calculate estimated cost (Claude Opus 4.5 pricing)
+    # Input: $5/1M, Output: $25/1M, Cache read: $0.50/1M, Cache write: $6.25/1M
+    local cost_estimate
+    cost_estimate=$(awk "BEGIN {
+        input_cost = ${input_tokens:-0} * 0.000005
+        output_cost = ${output_tokens:-0} * 0.000025
+        cache_read_cost = ${cache_read:-0} * 0.0000005
+        cache_write_cost = ${cache_write:-0} * 0.00000625
+        printf \"%.4f\", input_cost + output_cost + cache_read_cost + cache_write_cost
+    }")
+    
+    # Store usage in a temp file for the main loop to read
+    echo "${input_tokens:-0} ${output_tokens:-0} ${cache_read:-0} ${cache_write:-0} ${cost_estimate:-0}" > "/tmp/ralph_usage_${job_id}_${iteration}"
+
+    log_to_file "$job_id" "Duration: ${duration}s, Exit code: $exit_code"
+    log_to_file "$job_id" "Tokens: in=${input_tokens:-0} out=${output_tokens:-0} cache_read=${cache_read:-0} cache_write=${cache_write:-0}"
+    log_to_file "$job_id" "Estimated cost: \$${cost_estimate:-0}"
+
+    # Extract the text result from JSON (the "result" field)
+    local output
+    output=$(echo "$raw_output" | grep '"type":"result"' | grep -o '"result":"[^"]*"' | sed 's/"result":"//;s/"$//' | head -1)
+    
+    # If no result field, try to get from assistant message
+    if [ -z "$output" ]; then
+        output=$(echo "$raw_output" | grep '"type":"assistant"' | grep -o '"text":"[^"]*"' | tail -1 | sed 's/"text":"//;s/"$//')
+    fi
+    
+    # Unescape JSON string
+    output=$(echo "$output" | sed 's/\\n/\n/g; s/\\"/"/g; s/\\\\/\\/g')
+    
+    log_to_file "$job_id" "Output preview: $(echo "$output" | head -5 | tr '\n' ' ')"
+
+    # Store iteration result
+    echo "$output"
+    return $exit_code
+}
+
+# Main loop
+run_loop() {
+    local job_id="$1"
+
+    local state
+    state=$(load_job_state "$job_id")
+
+    local max_iterations
+    max_iterations=$(echo "$state" | jq -r '.limits.maxIterations')
+
+    local max_minutes
+    max_minutes=$(echo "$state" | jq -r '.limits.maxMinutes')
+
+    local start_time
+    start_time=$(date +%s)
+
+    local done_string
+    done_string=$(echo "$state" | jq -r '.completion.doneString // "RALPH_STATUS:done"')
+
+    local done_file
+    done_file=$(echo "$state" | jq -r '.completion.doneFile // empty')
+
+    local done_cmd
+    done_cmd=$(echo "$state" | jq -r '.completion.doneCmd // empty')
+
+    local git_enabled
+    git_enabled=$(echo "$state" | jq -r '.git.enabled')
+
+    local checkpoint_every
+    checkpoint_every=$(echo "$state" | jq -r '.git.checkpointEveryN')
+
+    local current_iteration
+    current_iteration=$(echo "$state" | jq -r '.currentIteration')
+    
+    # Cost tracking
+    local total_input_tokens=0
+    local total_output_tokens=0
+    local total_cache_read=0
+    local total_cache_write=0
+    local total_cost=0
+
+    # Record git start SHA
+    if [ "$git_enabled" = "true" ] && is_git_repo; then
+        local start_sha
+        start_sha=$(get_git_sha)
+        state=$(echo "$state" | jq ".git.startSha = \"$start_sha\"")
+        save_job_state "$job_id" "$state"
+    fi
+
+    log_header "Starting Ralph loop: $job_id"
+    log_info "Max iterations: $max_iterations"
+    log_info "Max minutes: $max_minutes"
+    log_info "Completion signal: $done_string"
+    echo ""
+
+    while true; do
+        # Check for cancellation
+        state=$(load_job_state "$job_id")
+        local status
+        status=$(echo "$state" | jq -r '.status')
+
+        if [ "$status" = "cancelled" ]; then
+            log_warn "Job cancelled by user"
+            break
+        fi
+
+        current_iteration=$((current_iteration + 1))
+
+        # Check iteration limit
+        if [ "$current_iteration" -gt "$max_iterations" ]; then
+            log_warn "Max iterations ($max_iterations) reached"
+            state=$(echo "$state" | jq '.status = "failed" | .safety.stopReason = "limit:maxIterations"')
+            save_job_state "$job_id" "$state"
+            break
+        fi
+
+        # Check time limit
+        local elapsed=$(( ($(date +%s) - start_time) / 60 ))
+        if [ "$elapsed" -ge "$max_minutes" ]; then
+            log_warn "Max time ($max_minutes minutes) reached"
+            state=$(echo "$state" | jq '.status = "failed" | .safety.stopReason = "limit:maxMinutes"')
+            save_job_state "$job_id" "$state"
+            break
+        fi
+
+        # Update state
+        state=$(echo "$state" | jq ".currentIteration = $current_iteration | .statusMessage = \"iteration $current_iteration running\"")
+        save_job_state "$job_id" "$state"
+
+        log_header "Iteration $current_iteration / $max_iterations"
+
+        # Run iteration
+        local output
+        local exit_code=0
+        output=$(run_iteration "$job_id" "$state" "$current_iteration") || exit_code=$?
+
+        # Reload state (thread ID may have been updated)
+        state=$(load_job_state "$job_id")
+        
+        # Read usage data from temp file
+        local usage_file="/tmp/ralph_usage_${job_id}_${current_iteration}"
+        if [ -f "$usage_file" ]; then
+            read -r iter_input iter_output iter_cache_read iter_cache_write iter_cost < "$usage_file"
+            total_input_tokens=$((total_input_tokens + iter_input))
+            total_output_tokens=$((total_output_tokens + iter_output))
+            total_cache_read=$((total_cache_read + iter_cache_read))
+            total_cache_write=$((total_cache_write + iter_cache_write))
+            total_cost=$(awk "BEGIN {printf \"%.4f\", $total_cost + $iter_cost}")
+            rm -f "$usage_file"
+            
+            # Display iteration cost
+            printf "${CYAN}[cost]${NC} Iteration: \$%.4f | Total: \$%.4f (in:%d out:%d)\n" "$iter_cost" "$total_cost" "$total_input_tokens" "$total_output_tokens"
+        fi
+
+        # Record iteration metrics
+        local iteration_record
+        iteration_record=$(jq -n \
+            --arg n "$current_iteration" \
+            --arg ts "$(timestamp)" \
+            --arg exit "$exit_code" \
+            --arg cost "${iter_cost:-0}" \
+            '{n: ($n|tonumber), timestamp: $ts, exitCode: ($exit|tonumber), cost: $cost}')
+
+        state=$(echo "$state" | jq ".metrics.iterations += [$iteration_record] | .metrics.totalIterations = $current_iteration")
+        state=$(echo "$state" | jq ".metrics.totalCost = $total_cost | .metrics.totalInputTokens = $total_input_tokens | .metrics.totalOutputTokens = $total_output_tokens")
+        save_job_state "$job_id" "$state"
+
+        # Handle amp failure
+        if [ "$exit_code" -ne 0 ]; then
+            log_error "Amp exited with code $exit_code"
+            log_to_file "$job_id" "Amp failed with exit code $exit_code"
+            state=$(echo "$state" | jq '.status = "failed" | .safety.stopReason = "error:amp-exit"')
+            save_job_state "$job_id" "$state"
+            break
+        fi
+
+        # Print output preview
+        echo "$output" | head -20
+        if [ "$(echo "$output" | wc -l)" -gt 20 ]; then
+            echo "... (truncated, see log for full output)"
+        fi
+
+        # Git checkpoint
+        if [ "$git_enabled" = "true" ] && [ $((current_iteration % checkpoint_every)) -eq 0 ]; then
+            local description
+            description=$(echo "$state" | jq -r '.description')
+            local sha
+            sha=$(git_checkpoint "$job_id" "$current_iteration" "$description")
+            if [ -n "$sha" ]; then
+                state=$(echo "$state" | jq ".git.lastCheckpointSha = \"$sha\"")
+                save_job_state "$job_id" "$state"
+                log_success "Git checkpoint: $sha"
+            fi
+        fi
+
+        # Check completion conditions
+        local completed=false
+        local completion_reason=""
+
+        # Check done string
+        if check_done_string "$output" "$done_string"; then
+            completed=true
+            completion_reason="doneString"
+            log_success "Completion signal detected: $done_string"
+        fi
+
+        # Check done file
+        if [ -n "$done_file" ] && check_done_file "$done_file"; then
+            completed=true
+            completion_reason="doneFile"
+            log_success "Completion file detected: $done_file"
+        fi
+
+        # Check done command
+        if [ -n "$done_cmd" ] && check_done_cmd "$done_cmd"; then
+            completed=true
+            completion_reason="doneCmd"
+            log_success "Completion command succeeded: $done_cmd"
+        fi
+
+        if [ "$completed" = true ]; then
+            log_header "Completion signal detected, running verification..."
+
+            # Run verification checks
+            if run_verification "$job_id" "$state"; then
+                state=$(load_job_state "$job_id")
+                state=$(echo "$state" | jq ".status = \"completed\" | .completion.satisfied = true | .completion.satisfiedBy = \"$completion_reason\"")
+                save_job_state "$job_id" "$state"
+
+                log_header "🎉 Task completed and verified!"
+                log_success "Completion reason: $completion_reason"
+                log_success "Total iterations: $current_iteration"
+                printf "${GREEN}[ralph]${NC} Total cost: ${BOLD}\$%.4f${NC} (in:%d out:%d)\n" "$total_cost" "$total_input_tokens" "$total_output_tokens"
+
+                # Final git checkpoint
+                if [ "$git_enabled" = "true" ]; then
+                    local sha
+                    sha=$(git_checkpoint "$job_id" "$current_iteration" "completed")
+                    if [ -n "$sha" ]; then
+                        log_success "Final git checkpoint: $sha"
+                    fi
+                fi
+
+                break
+            else
+                # Verification failed - continue iterating
+                log_warn "Verification failed! Amp claimed completion but requirements not met."
+                log_warn "Continuing iteration to fix issues..."
+                log_to_file "$job_id" "Verification failed after completion signal - continuing"
+
+                # Update state to reflect failed verification
+                state=$(load_job_state "$job_id")
+                state=$(echo "$state" | jq '.statusMessage = "verification failed, continuing"')
+                save_job_state "$job_id" "$state"
+            fi
+        fi
+
+        # Rotate logs if needed
+        maybe_rotate_logs "$job_id"
+
+        echo ""
+    done
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+cmd_start() {
+    local prompt_file=""
+    local prompt_text=""
+    local description="Ralph task"
+    local max_iterations=50
+    local max_minutes=120
+    local done_string="RALPH_STATUS:done"
+    local done_file=""
+    local done_cmd=""
+    local git_enabled=false
+    local checkpoint_every=1
+    local custom_job_id=""
+    local expect_files=""
+    local verify_cmd=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --prompt-file|-f)
+                prompt_file="$2"
+                shift 2
+                ;;
+            --prompt|-p)
+                prompt_text="$2"
+                shift 2
+                ;;
+            --description|-d)
+                description="$2"
+                shift 2
+                ;;
+            --max-iterations|-i)
+                max_iterations="$2"
+                shift 2
+                ;;
+            --max-minutes|-t)
+                max_minutes="$2"
+                shift 2
+                ;;
+            --done-string|-s)
+                done_string="$2"
+                shift 2
+                ;;
+            --done-file)
+                done_file="$2"
+                shift 2
+                ;;
+            --done-cmd)
+                done_cmd="$2"
+                shift 2
+                ;;
+            --expect-files|-e)
+                expect_files="$2"
+                shift 2
+                ;;
+            --verify-cmd|-v)
+                verify_cmd="$2"
+                shift 2
+                ;;
+            --git)
+                git_enabled=true
+                shift
+                ;;
+            --checkpoint-every)
+                checkpoint_every="$2"
+                shift 2
+                ;;
+            --job-id)
+                custom_job_id="$2"
+                shift 2
+                ;;
+            *)
+                # Treat as inline prompt if no other options
+                if [ -z "$prompt_text" ] && [ -z "$prompt_file" ]; then
+                    prompt_text="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate prompt
+    if [ -z "$prompt_file" ] && [ -z "$prompt_text" ]; then
+        log_error "No prompt specified. Use --prompt-file or --prompt"
+        exit 1
+    fi
+
+    if [ -n "$prompt_file" ] && [ ! -f "$prompt_file" ]; then
+        log_error "Prompt file not found: $prompt_file"
+        exit 1
+    fi
+
+    require_jq
+    require_amp
+    ensure_dirs
+
+    # Generate job ID
+    local job_id
+    if [ -n "$custom_job_id" ]; then
+        job_id="$custom_job_id"
+    else
+        job_id=$(generate_job_id "$description")
+    fi
+
+    local prompt_source
+    if [ -n "$prompt_file" ]; then
+        prompt_source="file"
+    else
+        prompt_source="inline"
+    fi
+
+    # Create job state
+    local state
+    state=$(create_job_state \
+        "$job_id" \
+        "$description" \
+        "$prompt_source" \
+        "$prompt_file" \
+        "$prompt_text" \
+        "$max_iterations" \
+        "$max_minutes" \
+        "$done_string" \
+        "$done_file" \
+        "$done_cmd" \
+        "$git_enabled" \
+        "$checkpoint_every" \
+        "$expect_files" \
+        "$verify_cmd"
+    )
+
+    save_job_state "$job_id" "$state"
+
+    log_info "Created job: $job_id"
+    log_info "State file: $(job_state_path "$job_id")"
+    log_info "Log file: $(job_log_path "$job_id")"
+
+    log_to_file "$job_id" "Job created"
+    log_to_file "$job_id" "Description: $description"
+    log_to_file "$job_id" "Max iterations: $max_iterations"
+    log_to_file "$job_id" "Max minutes: $max_minutes"
+
+    if [ -n "$expect_files" ]; then
+        log_info "Expected files: $expect_files"
+        log_to_file "$job_id" "Expected files: $expect_files"
+    fi
+
+    if [ -n "$verify_cmd" ]; then
+        log_info "Verification command: $verify_cmd"
+        log_to_file "$job_id" "Verification command: $verify_cmd"
+    fi
+
+    # Start the loop
+    run_loop "$job_id"
+}
+
+cmd_resume() {
+    local job_id="$1"
+
+    if [ -z "$job_id" ]; then
+        # Get most recent job
+        job_id=$(ls -t "$JOBS_DIR"/*.json 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/.json$//')
+        if [ -z "$job_id" ]; then
+            log_error "No jobs found"
+            exit 1
+        fi
+        log_info "Resuming most recent job: $job_id"
+    fi
+
+    require_jq
+    require_amp
+
+    local state
+    state=$(load_job_state "$job_id")
+
+    local status
+    status=$(echo "$state" | jq -r '.status')
+
+    if [ "$status" = "completed" ]; then
+        log_error "Job already completed"
+        exit 1
+    fi
+
+    if [ "$status" = "cancelled" ]; then
+        log_warn "Job was cancelled. Resetting to running..."
+    fi
+
+    # Reset status
+    state=$(echo "$state" | jq '.status = "running" | .safety.stopReason = null | .statusMessage = "resuming"')
+    save_job_state "$job_id" "$state"
+
+    log_to_file "$job_id" "Job resumed"
+
+    # Continue the loop
+    run_loop "$job_id"
+}
+
+cmd_status() {
+    local job_id="$1"
+
+    require_jq
+    ensure_dirs
+
+    if [ -z "$job_id" ]; then
+        # Get most recent job
+        job_id=$(ls -t "$JOBS_DIR"/*.json 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/.json$//')
+        if [ -z "$job_id" ]; then
+            log_error "No jobs found"
+            exit 1
+        fi
+    fi
+
+    local state
+    state=$(load_job_state "$job_id")
+
+    local status
+    status=$(echo "$state" | jq -r '.status')
+    local description
+    description=$(echo "$state" | jq -r '.description')
+    local thread_id
+    thread_id=$(echo "$state" | jq -r '.threadId // "none"')
+    local current_iteration
+    current_iteration=$(echo "$state" | jq -r '.currentIteration')
+    local max_iterations
+    max_iterations=$(echo "$state" | jq -r '.limits.maxIterations')
+    local created_at
+    created_at=$(echo "$state" | jq -r '.createdAt')
+    local updated_at
+    updated_at=$(echo "$state" | jq -r '.updatedAt')
+    local stop_reason
+    stop_reason=$(echo "$state" | jq -r '.safety.stopReason // "none"')
+    local completed
+    completed=$(echo "$state" | jq -r '.completion.satisfied')
+    local satisfied_by
+    satisfied_by=$(echo "$state" | jq -r '.completion.satisfiedBy // "none"')
+
+    local status_color
+    case $status in
+        running) status_color="${BLUE}" ;;
+        completed) status_color="${GREEN}" ;;
+        failed|cancelled) status_color="${RED}" ;;
+        *) status_color="${NC}" ;;
+    esac
+    
+    # Get cost metrics
+    local total_cost
+    total_cost=$(echo "$state" | jq -r '.metrics.totalCost // 0')
+    local total_input
+    total_input=$(echo "$state" | jq -r '.metrics.totalInputTokens // 0')
+    local total_output
+    total_output=$(echo "$state" | jq -r '.metrics.totalOutputTokens // 0')
+
+    echo ""
+    echo -e "${BOLD}Job:${NC} $job_id"
+    echo -e "${BOLD}Description:${NC} $description"
+    echo -e "${BOLD}Status:${NC} ${status_color}$status${NC}"
+    echo -e "${BOLD}Thread:${NC} $thread_id"
+    echo -e "${BOLD}Iterations:${NC} $current_iteration / $max_iterations"
+    echo -e "${BOLD}Created:${NC} $created_at"
+    echo -e "${BOLD}Updated:${NC} $updated_at"
+    
+    # Show cost if available
+    if [ "$total_cost" != "0" ] && [ "$total_cost" != "null" ]; then
+        printf "${BOLD}Cost:${NC} \$%.4f (in:%s out:%s tokens)\n" "$total_cost" "$total_input" "$total_output"
+    fi
+
+    if [ "$completed" = "true" ]; then
+        echo -e "${BOLD}Completed by:${NC} $satisfied_by"
+    fi
+
+    if [ "$stop_reason" != "none" ] && [ "$stop_reason" != "null" ]; then
+        echo -e "${BOLD}Stop reason:${NC} $stop_reason"
+    fi
+
+    echo -e "${BOLD}Log file:${NC} $(job_log_path "$job_id")"
+    echo ""
+}
+
+cmd_list() {
+    require_jq
+    ensure_dirs
+
+    local jobs
+    jobs=$(ls -t "$JOBS_DIR"/*.json 2>/dev/null | head -20)
+
+    if [ -z "$jobs" ]; then
+        log_info "No jobs found"
+        return
+    fi
+
+    echo ""
+    printf "${BOLD}%-45s %-10s %-6s %-10s %s${NC}\n" "JOB ID" "STATUS" "ITER" "COST" "DESCRIPTION"
+    echo "─────────────────────────────────────────────────────────────────────────────────────────────"
+
+    for job_file in $jobs; do
+        local job_id
+        job_id=$(basename "$job_file" .json)
+        local state
+        state=$(cat "$job_file")
+
+        local status
+        status=$(echo "$state" | jq -r '.status')
+        local current_iteration
+        current_iteration=$(echo "$state" | jq -r '.currentIteration')
+        local max_iterations
+        max_iterations=$(echo "$state" | jq -r '.limits.maxIterations')
+        local description
+        description=$(echo "$state" | jq -r '.description' | head -c 25)
+        local total_cost
+        total_cost=$(echo "$state" | jq -r '.metrics.totalCost // 0')
+        
+        local cost_display
+        if [ "$total_cost" != "0" ] && [ "$total_cost" != "null" ]; then
+            cost_display=$(printf "\$%.2f" "$total_cost")
+        else
+            cost_display="-"
+        fi
+
+        local status_color
+        case $status in
+            running) status_color="${BLUE}" ;;
+            completed) status_color="${GREEN}" ;;
+            failed|cancelled) status_color="${RED}" ;;
+            *) status_color="${NC}" ;;
+        esac
+
+        printf "%-45s ${status_color}%-10s${NC} %s/%-3s %-10s %s\n" "$job_id" "$status" "$current_iteration" "$max_iterations" "$cost_display" "$description"
+    done
+    echo ""
+}
+
+cmd_cancel() {
+    local job_id="$1"
+
+    if [ -z "$job_id" ]; then
+        log_error "Job ID required"
+        exit 1
+    fi
+
+    require_jq
+
+    local state
+    state=$(load_job_state "$job_id")
+
+    state=$(echo "$state" | jq ".status = \"cancelled\" | .safety.cancelledByUserAt = \"$(timestamp)\" | .safety.stopReason = \"userCancel\"")
+    save_job_state "$job_id" "$state"
+
+    log_to_file "$job_id" "Job cancelled by user"
+    log_success "Job cancelled: $job_id"
+}
+
+cmd_tail() {
+    local job_id="$1"
+    local follow="${2:-}"
+
+    require_jq
+    ensure_dirs
+
+    if [ -z "$job_id" ]; then
+        # Get most recent job
+        job_id=$(ls -t "$JOBS_DIR"/*.json 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/.json$//')
+        if [ -z "$job_id" ]; then
+            log_error "No jobs found"
+            exit 1
+        fi
+    fi
+
+    local log_file
+    log_file=$(job_log_path "$job_id")
+
+    if [ ! -f "$log_file" ]; then
+        log_error "Log file not found: $log_file"
+        exit 1
+    fi
+
+    if [ "$follow" = "-f" ] || [ "$follow" = "--follow" ]; then
+        tail -f "$log_file"
+    else
+        tail -100 "$log_file"
+    fi
+}
+
+cmd_help() {
+    printf "%bRalph%b - Iterative AI Agent Loop for Amp\n" "$BOLD" "$NC"
+    printf "Version: %s\n\n" "$RALPH_VERSION"
+
+    printf "%bUSAGE%b\n" "$BOLD" "$NC"
+    printf "    ralph <command> [options]\n\n"
+
+    printf "%bCOMMANDS%b\n" "$BOLD" "$NC"
+    printf "    start     Start a new Ralph loop\n"
+    printf "    resume    Resume a paused or failed job\n"
+    printf "    status    Show job status (default: most recent)\n"
+    printf "    list      List recent jobs\n"
+    printf "    cancel    Cancel a running job\n"
+    printf "    tail      Tail job logs (-f to follow)\n"
+    printf "    help      Show this help\n\n"
+
+    printf "%bSTART OPTIONS%b\n" "$BOLD" "$NC"
+    printf "    --prompt, -p <text>       Inline prompt text\n"
+    printf "    --prompt-file, -f <path>  Path to prompt file\n"
+    printf "    --description, -d <text>  Job description (used in job ID)\n"
+    printf "    --max-iterations, -i <n>  Maximum iterations (default: 50)\n"
+    printf "    --max-minutes, -t <n>     Maximum runtime in minutes (default: 120)\n"
+    printf "    --done-string, -s <text>  Completion signal string (default: RALPH_STATUS:done)\n"
+    printf "    --done-file <path>        Complete when this file exists\n"
+    printf "    --done-cmd <command>      Complete when this command succeeds\n"
+    printf "    --expect-files, -e <glob> Required files (comma-separated, supports globs)\n"
+    printf "    --verify-cmd, -v <cmd>    Verification command (must pass for completion)\n"
+    printf "    --git                     Enable git checkpointing (off by default)\n"
+    printf "    --checkpoint-every <n>    Git checkpoint frequency (default: 1)\n"
+    printf "    --job-id <id>             Custom job ID\n\n"
+
+    printf "%bEXAMPLES%b\n" "$BOLD" "$NC"
+    printf "    # Start with inline prompt\n"
+    printf "    ralph start -p \"Build a REST API with CRUD operations. Output RALPH_STATUS:done when complete.\"\n\n"
+    printf "    # Start with prompt file\n"
+    printf "    ralph start -f prompts/my-task.md -d \"API implementation\" --max-iterations 30\n\n"
+    printf "    # Start with test-based completion\n"
+    printf "    ralph start -p \"Fix the failing tests\" --done-cmd \"npm test\"\n\n"
+    printf "    # Require test files to exist (won't complete without them)\n"
+    printf "    ralph start -p \"Build a Go API with tests\" --expect-files \"*_test.go\" --verify-cmd \"go test ./...\"\n\n"
+    printf "    # Resume the last job\n"
+    printf "    ralph resume\n\n"
+    printf "    # Check status\n"
+    printf "    ralph status\n\n"
+    printf "    # Follow logs\n"
+    printf "    ralph tail -f\n\n"
+
+    printf "%bFILES%b\n" "$BOLD" "$NC"
+    printf "    Jobs:  .amp/ralph/jobs/<jobId>.json\n"
+    printf "    Logs:  .amp/ralph/logs/<jobId>.log\n\n"
+
+    printf "%bENVIRONMENT%b\n" "$BOLD" "$NC"
+    printf "    RALPH_DIR          Override base directory (default: .amp/ralph)\n"
+    printf "    MAX_LOG_SIZE       Max log file size in bytes (default: 10MB)\n"
+    printf "    MAX_LOG_BACKUPS    Number of log backups to keep (default: 3)\n"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    case $command in
+        start)
+            cmd_start "$@"
+            ;;
+        resume)
+            cmd_resume "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        cancel)
+            cmd_cancel "$@"
+            ;;
+        tail)
+            cmd_tail "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        --version|-V)
+            echo "ralph version $RALPH_VERSION"
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
